@@ -1,0 +1,96 @@
+name: Build kernel for dipper
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build kernel by ${{ github.actor }}
+    runs-on: ubuntu-latest
+    env:
+      ARCH: "arm64"
+      MAKE_DEFCONFIG: "vendor/xiaomi/mi845_defconfig vendor/xiaomi/dipper.config"
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+
+    steps:
+    - name: Download kernel source
+      uses: actions/checkout@v4
+
+    - name: Set swap to 10g
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: 10
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update -y
+        # sudo apt install gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi -y
+        sudo apt install curl binutils make python3 libssl-dev build-essential bc bison flex unzip libssl-dev ca-certificates xz-utils mkbootimg cpio device-tree-compiler git git-lfs -y
+
+    - name: Set up ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        max-size: 2G
+
+    - name: Download toolchains
+      run: |
+        git clone --recursive --depth=1 -j $(nproc --all) "https://github.com/kdrag0n/proton-clang" toolchains_clang -b master && {
+          # git clone --recursive --depth=1 -j $(nproc --all) "https://android.googlesource.com/platform/prebuilts/gas/linux-x86" toolchains_gas -b master
+          # cp toolchains_gas/*-as toolchains_clang/bin
+          # cp toolchains_gas/*-elfedit toolchains_clang/bin
+          echo "$GITHUB_WORKSPACE/toolchains_clang/bin" >> $GITHUB_PATH
+        }
+
+    - name: Build kernel
+      run: |
+        export KBUILD_BUILD_HOST=Github-Action
+        export KBUILD_BUILD_USER=$(echo ${{ github.actor }} | tr A-Z a-z)
+
+        rm -rf KernelSU
+        rm -rf drivers/kernelsu
+        curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+
+        cat <<'EOF' > arch/${{ env.ARCH }}/configs/my.config
+        CONFIG_TCP_CONG_ADVANCED=y
+        CONFIG_TCP_CONG_CUBIC=y
+        CONFIG_TCP_CONG_BBR=y
+        CONFIG_TCP_CONG_WESTWOOD=y
+        CONFIG_DEFAULT_WESTWOOD=y
+        
+        CONFIG_CRYPTO_LZ4=y
+        CONFIG_CRYPTO_LZ4HC=y
+        CONFIG_CRYPTO_ZSTD=y
+        EOF
+
+        make O=out ARCH=${{ env.ARCH }} ${{ env.MAKE_DEFCONFIG }} my.config && \
+        LD=ld.lld make -j $(nproc --all) O=out ARCH=${{ env.ARCH }} CC="ccache clang" \
+          KBUILD_COMPILER_STRING="Proton Clang" \
+          AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+    - name: Check output files
+      run: |
+        ls out/arch/${{ env.ARCH }}/boot/Image* && {
+          mkdir out/outputs
+          mv out/arch/${{ env.ARCH }}/boot/Image* out/outputs/
+          cp .config out/outputs/ 2>/dev/null || cp out/.config out/outputs/ 2>/dev/null || echo "Cannot find .config"
+          echo "CHECK_FILE_IS_OK=true" >> $GITHUB_ENV
+        }
+
+    - name: Retrieve information
+      if: env.CHECK_FILE_IS_OK == 'true'
+      run: |
+        echo VERSION=$(date "+%Y%m%d")-$(echo ${{ github.event.head_commit.id }} | head -c 7) >> $GITHUB_ENV
+        echo BRANCH=$(git branch --show-current) >> $GITHUB_ENV
+
+    - name: Upload output files
+      if: env.CHECK_FILE_IS_OK == 'true'
+      uses: actions/upload-artifact@v3
+      with:
+        name: dipper-kernel-${{ env.BRANCH }}-${{ env.VERSION }}
+        path: |
+          out/outputs/
