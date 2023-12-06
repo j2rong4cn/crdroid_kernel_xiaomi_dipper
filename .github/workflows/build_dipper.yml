@@ -1,8 +1,16 @@
 name: Build kernel for dipper
 on:
   push:
+    paths-ignore:
+      - ".github/**"
+      - "!.github/workflows/build_dipper.yml"
   pull_request:
+     paths-ignore:
+      - ".github/**"
+      - "!.github/workflows/build_dipper.yml"
   workflow_dispatch:
+permissions:
+  actions: write
 
 jobs:
   build:
@@ -11,16 +19,14 @@ jobs:
     env:
       ARCH: "arm64"
       MAKE_DEFCONFIG: "vendor/xiaomi/mi845_defconfig vendor/xiaomi/dipper.config"
-      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
-      CCACHE_NOHASHDIR: "true"
-      CCACHE_HARDLINK: "true"
-
+      GH_TOKEN: ${{ github.token }}
+    
     steps:
     - name: Download kernel source
       uses: actions/checkout@v4
 
-    - name: Set swap to 10g
-      uses: pierotofy/set-swap-space@master
+    - name: Set up swap
+      uses: pierotofy/set-swap-space@v1.0
       with:
         swap-size-gb: 10
 
@@ -30,21 +36,40 @@ jobs:
         # sudo apt install gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi -y
         sudo apt install curl binutils make python3 libssl-dev build-essential bc bison flex unzip libssl-dev ca-certificates xz-utils mkbootimg cpio device-tree-compiler git git-lfs -y
 
+    - name: Retrieve information
+      run: |
+        echo VERSION=$(date "+%Y%m%d")-$(git rev-parse HEAD | head -c 7) >> $GITHUB_ENV
+        BRANCH=$(git branch --show-current)
+        echo BRANCH=$BRANCH >> $GITHUB_ENV
+        echo CCACHE_KEY=$BRANCH-$(basename ${GITHUB_WORKFLOW_REF%@*}) >> $GITHUB_ENV
+
     - name: Set up ccache
-      uses: hendrikmuhs/ccache-action@v1.2
+      uses: hendrikmuhs/ccache-action@v1.2.10
       with:
+        key: ${{ env.CCACHE_KEY }}
         max-size: 2G
 
-    - name: Download toolchains
+    - name: Restore toolchains from cache
+      uses: actions/cache/restore@v3
+      with:
+        path: toolchains
+        key: toolchains
+
+    - name: Check & Download toolchains
       run: |
-        git clone --recursive --depth=1 -j $(nproc --all) "https://github.com/kdrag0n/proton-clang" toolchains_clang -b master && {
-          # git clone --recursive --depth=1 -j $(nproc --all) "https://android.googlesource.com/platform/prebuilts/gas/linux-x86" toolchains_gas -b master
-          # cp toolchains_gas/*-as toolchains_clang/bin
-          # cp toolchains_gas/*-elfedit toolchains_clang/bin
-          echo "$GITHUB_WORKSPACE/toolchains_clang/bin" >> $GITHUB_PATH
-        }
+        test -d toolchains/bin || (
+          git clone --recursive --depth=1 -j $(nproc --all) "https://github.com/kdrag0n/proton-clang" toolchains -b master && {
+            rm -r toolchains/.git
+            echo IS_SAVE_TOOLCHAINS=true >> $GITHUB_ENV
+          }
+        )
+        test $? -eq 0 && echo ${{ github.workspace }}/toolchains/bin >> $GITHUB_PATH
 
     - name: Build kernel
+      env:
+        CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+        CCACHE_NOHASHDIR: "true"
+        CCACHE_HARDLINK: "true"
       run: |
         export KBUILD_BUILD_HOST=Github-Action
         export KBUILD_BUILD_USER=$(echo ${{ github.actor }} | tr A-Z a-z)
@@ -66,9 +91,9 @@ jobs:
         EOF
 
         make O=out ARCH=${{ env.ARCH }} ${{ env.MAKE_DEFCONFIG }} my.config && \
-        LD=ld.lld make -j $(nproc --all) O=out ARCH=${{ env.ARCH }} CC="ccache clang" \
+        make -j $(nproc --all) O=out ARCH=${{ env.ARCH }} CC="ccache clang" \
+          LD=ld.lld ld-name=lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump READELF=llvm-readelf OBJSIZE=llvm-size STRIP=llvm-strip \
           KBUILD_COMPILER_STRING="Proton Clang" \
-          AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
           CROSS_COMPILE=aarch64-linux-gnu- \
           CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 
@@ -81,12 +106,6 @@ jobs:
           echo "CHECK_FILE_IS_OK=true" >> $GITHUB_ENV
         }
 
-    - name: Retrieve information
-      if: env.CHECK_FILE_IS_OK == 'true'
-      run: |
-        echo VERSION=$(date "+%Y%m%d")-$(echo ${{ github.event.head_commit.id }} | head -c 7) >> $GITHUB_ENV
-        echo BRANCH=$(git branch --show-current) >> $GITHUB_ENV
-
     - name: Upload output files
       if: env.CHECK_FILE_IS_OK == 'true'
       uses: actions/upload-artifact@v3
@@ -94,3 +113,21 @@ jobs:
         name: dipper-kernel-${{ env.BRANCH }}-${{ env.VERSION }}
         path: |
           out/outputs/
+
+    - name: Delete old cache
+      continue-on-error: true
+      run: |
+        gh extension install actions/gh-actions-cache
+        cacheKeysForPR=$(gh actions-cache list -L 100 -R ${{ github.repository }} | cut -f 1)
+        if test -n "$cacheKeysForPR"; then
+          for cacheKey in $cacheKeysForPR; do
+            test -n "${cacheKey##ccache-${{ env.CCACHE_KEY }}*}" || gh actions-cache delete $cacheKey -R ${{ github.repository }} --confirm
+          done
+        fi
+
+    - name: Save toolchains to cache
+      if: ${{ env.IS_SAVE_TOOLCHAINS == 'true' && !cancelled() }}
+      uses: actions/cache/save@v3
+      with:
+        path: toolchains
+        key: toolchains
