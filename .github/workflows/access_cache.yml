@@ -1,0 +1,40 @@
+name: Access cache
+on:
+  workflow_dispatch:
+  schedule:
+      - cron: '0 3 1,*/6 * *'
+
+jobs:
+  test:
+    name: Accessing cache to prevent deletion
+    runs-on: ubuntu-latest
+    steps:
+    - name: Restore toolchains from cache
+      uses: actions/cache/restore@v3
+      with:
+        path: toolchains
+        key: toolchains
+        lookup-only: true
+
+    - name: Retrieve CCACHE_KEY
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh extension install actions/gh-actions-cache
+        cacheKeysForPR=$(gh actions-cache list -L 100 -R ${{ github.repository }} | cut -f 1)
+        if test -n "$cacheKeysForPR"; then
+          for cacheKey in $cacheKeysForPR; do
+            test -n "${cacheKey##ccache-${{ github.ref_name }}*}" || {
+              echo CCACHE_KEY=$cacheKey >> $GITHUB_ENV
+              break
+            }
+          done
+        fi
+
+    - name: Restore ccache from cache
+      uses: actions/cache/restore@v3
+      with:
+        path: .ccache
+        key: ${{ env.CCACHE_KEY }}
+        lookup-only: true
+
