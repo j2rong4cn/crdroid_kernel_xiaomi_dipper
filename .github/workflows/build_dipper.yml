@@ -19,11 +19,12 @@ jobs:
     env:
       ARCH: "arm64"
       MAKE_DEFCONFIG: "vendor/xiaomi/mi845_defconfig vendor/xiaomi/dipper.config"
-      GH_TOKEN: ${{ github.token }}
     
     steps:
     - name: Download kernel source
       uses: actions/checkout@v4
+      with:
+        path: kernel_source
 
     - name: Set up swap
       uses: pierotofy/set-swap-space@v1.0
@@ -38,10 +39,13 @@ jobs:
 
     - name: Retrieve information
       run: |
-        echo VERSION=$(date "+%Y%m%d")-$(git rev-parse HEAD | head -c 7) >> $GITHUB_ENV
+        cd kernel_source
+        sudo timedatectl set-timezone Asia/Shanghai
+        echo VERSION=$(date "+%y%m%d_%H%M")-$(git rev-parse HEAD | head -c 7) >> $GITHUB_ENV
         BRANCH=$(git branch --show-current)
         echo BRANCH=$BRANCH >> $GITHUB_ENV
         echo CCACHE_KEY=$BRANCH-$(basename ${GITHUB_WORKFLOW_REF%@*}) >> $GITHUB_ENV
+        test -n "${{ secrets.SOURCE_BOOT_IMAGE }}" && echo BUILD_BOOT_IMG=true >> $GITHUB_ENV
 
     - name: Set up ccache
       uses: hendrikmuhs/ccache-action@v1.2.10
@@ -71,6 +75,7 @@ jobs:
         CCACHE_NOHASHDIR: "true"
         CCACHE_HARDLINK: "true"
       run: |
+        cd kernel_source
         export KBUILD_BUILD_HOST=Github-Action
         export KBUILD_BUILD_USER=$(echo ${{ github.actor }} | tr A-Z a-z)
 
@@ -85,9 +90,8 @@ jobs:
         CONFIG_TCP_CONG_WESTWOOD=y
         CONFIG_DEFAULT_WESTWOOD=y
         
-        CONFIG_CRYPTO_LZ4=y
-        CONFIG_CRYPTO_LZ4HC=y
         CONFIG_CRYPTO_ZSTD=y
+        CONFIG_ZRAM_DEFAULT_COMP_ALGORITHM="zstd"
         EOF
 
         make O=out ARCH=${{ env.ARCH }} ${{ env.MAKE_DEFCONFIG }} my.config && \
@@ -99,12 +103,25 @@ jobs:
 
     - name: Check output files
       run: |
-        ls out/arch/${{ env.ARCH }}/boot/Image* && {
-          mkdir out/outputs
-          mv out/arch/${{ env.ARCH }}/boot/Image* out/outputs/
-          cp .config out/outputs/ 2>/dev/null || cp out/.config out/outputs/ 2>/dev/null || echo "Cannot find .config"
+        ls kernel_source/out/arch/${{ env.ARCH }}/boot/Image.gz-dtb && {
+          mkdir outputs
+          cp kernel_source/out/arch/${{ env.ARCH }}/boot/Image.gz-dtb outputs/
+          cp kernel_source/out/.config outputs/ 2>/dev/null || echo "Cannot find .config"
           echo "CHECK_FILE_IS_OK=true" >> $GITHUB_ENV
         }
+
+    - name: Make boot image
+      if: env.CHECK_FILE_IS_OK == 'true' && env.BUILD_BOOT_IMG == 'true'
+      run: |
+        wget -qO boot-source.img ${{ secrets.SOURCE_BOOT_IMAGE }}
+        if test $? -eq 0 -a -f boot-source.img; then
+          git clone --recursive --depth=1 -j $(nproc --all) https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg_tools -b master-kernel-build-2022 && {
+            FORMAT_MKBOOTING=$(mkbootimg_tools/unpack_bootimg.py --boot_img=boot-source.img --format mkbootimg)
+            mkbootimg_tools/unpack_bootimg.py --boot_img boot-source.img && \
+              cp outputs/Image.gz-dtb out/kernel && \
+              eval mkbootimg_tools/mkbootimg.py $FORMAT_MKBOOTING -o outputs/boot.img
+          }
+        fi
 
     - name: Upload output files
       if: env.CHECK_FILE_IS_OK == 'true'
@@ -112,9 +129,11 @@ jobs:
       with:
         name: dipper-kernel-${{ env.BRANCH }}-${{ env.VERSION }}
         path: |
-          out/outputs/
+          outputs/
 
     - name: Delete old cache
+      env:
+        GH_TOKEN: ${{ github.token }}
       continue-on-error: true
       run: |
         gh extension install actions/gh-actions-cache
